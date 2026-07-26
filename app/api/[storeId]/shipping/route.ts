@@ -25,20 +25,19 @@ type AddressType = {
   phone?: string
 }
 
-// Only identity + quantity are trusted from the client — price is resolved
-// server-side (bundle tier / sale, same as checkout/route.ts) so a spoofed
-// `bundlePrice` can't under-declare what gets charged for shipping OR the
-// customs/insurance declared value below. `weight` remains client-supplied
-// for now — a separate, lower-severity trust gap tracked as a follow-up.
+// Only identity + quantity are trusted from the client — price and weight
+// are both resolved server-side (bundle tier / sale, and product.weight,
+// same source of truth as checkout/route.ts) so a spoofed `bundlePrice` or
+// `weight` can't under-declare what gets charged for shipping, the
+// customs/insurance declared value, or the parcel weight used to fetch rates.
 type CartItemType = {
   productId: string
   variationId?: string
   name: string
-  weight: string
   cartQuantity: number
 }
 
-type PricedCartItem = CartItemType & { unitPriceInCents: number }
+type PricedCartItem = CartItemType & { unitPriceInCents: number; weight: number }
 
 type CustomsDeclarationInfo = {
   items: {
@@ -139,12 +138,12 @@ export async function POST(req: Request) {
         applicableSales
       )
 
-      pricedCartItems.push({ ...item, unitPriceInCents })
+      pricedCartItems.push({ ...item, unitPriceInCents, weight: Number(product.weight) })
     }
 
     // Calculate total weight and price
     const totalWeight = pricedCartItems.reduce(
-      (acc, cartItem) => acc + Number(cartItem.weight) * cartItem.cartQuantity,
+      (acc, cartItem) => acc + cartItem.weight * cartItem.cartQuantity,
       0
     )
 
@@ -160,7 +159,7 @@ export async function POST(req: Request) {
       quantity: cartItem.cartQuantity,
       total_price: formatPrice(cartItem.unitPriceInCents * cartItem.cartQuantity),
       currency: currency,
-      weight: (Number(cartItem.weight) * cartItem.cartQuantity).toString(),
+      weight: (cartItem.weight * cartItem.cartQuantity).toString(),
       weight_unit: 'g',
       mass_unit: 'g',
       manufacture_country: 'CA'

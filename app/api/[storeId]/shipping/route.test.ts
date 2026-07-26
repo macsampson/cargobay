@@ -32,7 +32,6 @@ const validCartItems = [
   {
     productId: 'p1',
     name: 'Widget',
-    weight: '100',
     cartQuantity: 2
   }
 ]
@@ -44,6 +43,7 @@ function makeProduct(overrides: Partial<any> = {}) {
     name: 'Widget',
     priceInCents: 1000,
     quantity: 10,
+    weight: 100,
     bundles: [],
     variations: [],
     ...overrides
@@ -133,7 +133,6 @@ describe('POST /api/[storeId]/shipping', () => {
           {
             productId: 'p1',
             name: 'Widget',
-            weight: '100',
             cartQuantity: 2,
             // These should have zero effect now that price is DB-derived.
             bundlePrice: 1,
@@ -151,6 +150,34 @@ describe('POST /api/[storeId]/shipping', () => {
     )
   })
 
+  it('uses the product weight from the DB, ignoring a spoofed client-supplied weight (regression test)', async () => {
+    prismaMock.product.findMany.mockResolvedValue([makeProduct({ weight: 50 })])
+
+    await POST(
+      makeRequest({
+        address: validAddress,
+        cartItems: [
+          {
+            productId: 'p1',
+            name: 'Widget',
+            cartQuantity: 2,
+            // Should have zero effect — weight is DB-derived, not client-supplied.
+            weight: '999999'
+          }
+        ],
+        currency: 'usd'
+      })
+    )
+
+    // 50g per unit * 2 = 100g, not 999999 * 2
+    expect(createShippoShipmentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lineItems: [expect.objectContaining({ weight: '100' })],
+        parcel: expect.objectContaining({ weight: '100' })
+      })
+    )
+  })
+
   it('applies a qualifying bundle tier discount to the shipping quote and customs value', async () => {
     prismaMock.product.findMany.mockResolvedValue([
       makeProduct({ priceInCents: 1000, bundles: [{ id: 'b1', minQuantity: 2, discountPercentage: 15 }] })
@@ -159,7 +186,7 @@ describe('POST /api/[storeId]/shipping', () => {
     await POST(
       makeRequest({
         address: { ...validAddress, country: 'US' },
-        cartItems: [{ productId: 'p1', name: 'Widget', weight: '100', cartQuantity: 2 }],
+        cartItems: [{ productId: 'p1', name: 'Widget', cartQuantity: 2 }],
         currency: 'usd'
       })
     )
@@ -181,7 +208,7 @@ describe('POST /api/[storeId]/shipping', () => {
     const response = await POST(
       makeRequest({
         address: validAddress,
-        cartItems: [{ productId: 'ghost', name: 'Ghost', weight: '1', cartQuantity: 1 }],
+        cartItems: [{ productId: 'ghost', name: 'Ghost', cartQuantity: 1 }],
         currency: 'usd'
       })
     )
@@ -197,7 +224,7 @@ describe('POST /api/[storeId]/shipping', () => {
     const response = await POST(
       makeRequest({
         address: validAddress,
-        cartItems: [{ productId: 'p1', variationId: 'nope', name: 'Widget', weight: '1', cartQuantity: 1 }],
+        cartItems: [{ productId: 'p1', variationId: 'nope', name: 'Widget', cartQuantity: 1 }],
         currency: 'usd'
       })
     )
