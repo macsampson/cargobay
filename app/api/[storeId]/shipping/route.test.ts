@@ -30,15 +30,25 @@ const validAddress = {
 
 const validCartItems = [
   {
-    id: 'p1',
+    productId: 'p1',
     name: 'Widget',
-    priceInCents: 1000,
     weight: '100',
-    bundles: [],
-    cartQuantity: 2,
-    variations: {}
+    cartQuantity: 2
   }
 ]
+
+function makeProduct(overrides: Partial<any> = {}) {
+  return {
+    id: 'p1',
+    storeId: 'store-1',
+    name: 'Widget',
+    priceInCents: 1000,
+    quantity: 10,
+    bundles: [],
+    variations: [],
+    ...overrides
+  }
+}
 
 function makeRequest(body: any) {
   return new Request('http://localhost/api/store-1/shipping', {
@@ -94,6 +104,8 @@ describe('POST /api/[storeId]/shipping', () => {
     jest.clearAllMocks()
     global.fetch = jest.fn()
     prismaMock.shippingSettings.findUnique.mockResolvedValue(baseSettings())
+    prismaMock.product.findMany.mockResolvedValue([makeProduct()])
+    prismaMock.sale.findMany.mockResolvedValue([])
     createShippoShipmentMock.mockResolvedValue({ rates: [shippoRate], messages: [], httpOk: true, raw: {} })
   })
 
@@ -109,6 +121,88 @@ describe('POST /api/[storeId]/shipping', () => {
     expect(data.rates[0]).toEqual(
       expect.objectContaining({ id: 'rate_1', provider: 'Shippo', title: 'Priority Mail' })
     )
+  })
+
+  it('prices the Shippo line item from the DB, ignoring any client-supplied bundlePrice/priceInCents (regression test)', async () => {
+    prismaMock.product.findMany.mockResolvedValue([makeProduct({ priceInCents: 1000 })])
+
+    await POST(
+      makeRequest({
+        address: validAddress,
+        cartItems: [
+          {
+            productId: 'p1',
+            name: 'Widget',
+            weight: '100',
+            cartQuantity: 2,
+            // These should have zero effect now that price is DB-derived.
+            bundlePrice: 1,
+            priceInCents: 1
+          }
+        ],
+        currency: 'usd'
+      })
+    )
+
+    expect(createShippoShipmentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lineItems: [expect.objectContaining({ total_price: '20.00' })]
+      })
+    )
+  })
+
+  it('applies a qualifying bundle tier discount to the shipping quote and customs value', async () => {
+    prismaMock.product.findMany.mockResolvedValue([
+      makeProduct({ priceInCents: 1000, bundles: [{ id: 'b1', minQuantity: 2, discountPercentage: 15 }] })
+    ])
+
+    await POST(
+      makeRequest({
+        address: { ...validAddress, country: 'US' },
+        cartItems: [{ productId: 'p1', name: 'Widget', weight: '100', cartQuantity: 2 }],
+        currency: 'usd'
+      })
+    )
+
+    // unit price 850 * 2 = 1700 cents = $17.00
+    expect(createShippoShipmentMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        lineItems: [expect.objectContaining({ total_price: '17.00' })],
+        customsDeclaration: expect.objectContaining({
+          items: [expect.objectContaining({ value_amount: '17.00' })]
+        })
+      })
+    )
+  })
+
+  it('returns 400 for an unknown productId', async () => {
+    prismaMock.product.findMany.mockResolvedValue([])
+
+    const response = await POST(
+      makeRequest({
+        address: validAddress,
+        cartItems: [{ productId: 'ghost', name: 'Ghost', weight: '1', cartQuantity: 1 }],
+        currency: 'usd'
+      })
+    )
+    const data = await response.json()
+
+    expect(response.status).toBe(400)
+    expect(data.success).toBe(false)
+  })
+
+  it('returns 400 when a variationId does not belong to the specified product', async () => {
+    prismaMock.product.findMany.mockResolvedValue([makeProduct({ variations: [] })])
+
+    const response = await POST(
+      makeRequest({
+        address: validAddress,
+        cartItems: [{ productId: 'p1', variationId: 'nope', name: 'Widget', weight: '1', cartQuantity: 1 }],
+        currency: 'usd'
+      })
+    )
+
+    expect(response.status).toBe(400)
   })
 
   it('does not call Shippo when it is disabled', async () => {

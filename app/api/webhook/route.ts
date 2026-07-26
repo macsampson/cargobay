@@ -6,21 +6,20 @@ import { stripe } from '@/lib/stripe'
 import prismadb from '@/lib/prismadb'
 import { logger } from '@/lib/logger'
 
-interface CartItem {
-  name: string
-  category: string
+// Matches the compact, server-computed shape checkout/route.ts writes into
+// session.metadata.cartItems. unitPriceInCents was resolved from bundle/sale
+// rules at checkout time and is persisted verbatim here — never recomputed,
+// since Stripe already collected payment at that price and the underlying
+// bundle/sale rules may have changed by the time this webhook fires.
+interface CartItemMeta {
+  productId: string
+  variationId: string | null
   quantity: number
-  priceInCents: number
-  variations?: Record<
-    string,
-    {
-      name: string
-      priceInCents: number
-      cartQuantity: number
-      inventoryAmount: number
-    }
-  >
-  weight?: number
+  name: string
+  weight: number
+  unitPriceInCents: number
+  discountType: 'bundle' | 'sale' | 'none'
+  discountId: string | null
 }
 
 export interface Address {
@@ -84,118 +83,108 @@ export async function POST(req: Request) {
       )
       const shippingType = JSON.parse(session.metadata.shippingType || '{}')
       const currency = session.metadata.currency || 'usd'
-      const cartItems: Record<string, CartItem> = JSON.parse(
-        session.metadata.cartItems || '{}'
+      const cartItems: CartItemMeta[] = JSON.parse(
+        session.metadata.cartItems || '[]'
       )
 
       logger.info('Processing order for store:', storeId)
-      logger.info('Cart items:', Object.keys(cartItems).length)
+      logger.info('Cart items:', cartItems.length)
       logger.info('Shipping method:', shippingType.title || 'None')
       logger.info('Currency:', currency.toUpperCase())
 
       // Calculate total price in cents from session
       const totalPriceInCents = Math.round(session.amount_total || 0)
 
-      // Create order in database
-      const order = await prismadb.order.create({
-        data: {
-          storeId,
-          isPaid: true,
-          phoneNumber: session?.customer_details?.phone || shippingAddress.phone || '',
-          emailAddress: session?.customer_details?.email || shippingAddress.email || '',
-          customerName: session?.customer_details?.name || `${shippingAddress.firstName || ''} ${shippingAddress.lastName || ''}`.trim(),
-          billingAddress: session.customer_details?.address ? 
-            `${session.customer_details.address.line1 || ''} ${session.customer_details.address.line2 || ''}, ${session.customer_details.address.city || ''}, ${session.customer_details.address.state || ''} ${session.customer_details.address.postal_code || ''}, ${session.customer_details.address.country || ''}`.trim() 
-            : '',
-          shippingAddress: `${shippingAddress.street || ''} ${
-            shippingAddress.apartment || ''
-          }, ${shippingAddress.city || ''}, ${shippingAddress.state || ''} ${
-            shippingAddress.zip || ''
-          }, ${shippingAddress.country || ''}`.trim(),
-          totalPriceInCents
-        }
+      // Batched lookups — one round trip each, regardless of cart size — to
+      // confirm each product/variation still exists before writing order items
+      // and to know which rows need their inventory decremented.
+      const productIds = Array.from(new Set(cartItems.map((item) => item.productId)))
+      const variationIds = Array.from(
+        new Set(cartItems.filter((item) => item.variationId).map((item) => item.variationId as string))
+      )
+
+      const [products, variations] = await Promise.all([
+        prismadb.product.findMany({ where: { id: { in: productIds }, storeId } }),
+        variationIds.length > 0
+          ? prismadb.productVariation.findMany({ where: { id: { in: variationIds } } })
+          : Promise.resolve([])
+      ])
+      const productById = new Map(products.map((p) => [p.id, p]))
+      const variationById = new Map(variations.map((v) => [v.id, v]))
+
+      const validItems = cartItems.filter((item) => {
+        if (!productById.has(item.productId)) return false
+        if (item.variationId && !variationById.has(item.variationId)) return false
+        return true
       })
 
-      // Create order items
-      const orderItems = []
-      for (const [productId, item] of Object.entries(cartItems)) {
-        const product = await prismadb.product.findUnique({
-          where: {
-            id: productId,
-            storeId
+      const order = await prismadb.$transaction(async (tx) => {
+        const order = await tx.order.create({
+          data: {
+            storeId,
+            isPaid: true,
+            phoneNumber: session?.customer_details?.phone || shippingAddress.phone || '',
+            emailAddress: session?.customer_details?.email || shippingAddress.email || '',
+            customerName: session?.customer_details?.name || `${shippingAddress.firstName || ''} ${shippingAddress.lastName || ''}`.trim(),
+            billingAddress: session.customer_details?.address ?
+              `${session.customer_details.address.line1 || ''} ${session.customer_details.address.line2 || ''}, ${session.customer_details.address.city || ''}, ${session.customer_details.address.state || ''} ${session.customer_details.address.postal_code || ''}, ${session.customer_details.address.country || ''}`.trim()
+              : '',
+            shippingAddress: `${shippingAddress.street || ''} ${
+              shippingAddress.apartment || ''
+            }, ${shippingAddress.city || ''}, ${shippingAddress.state || ''} ${
+              shippingAddress.zip || ''
+            }, ${shippingAddress.country || ''}`.trim(),
+            totalPriceInCents
           }
         })
 
-        if (product) {
-          // Handle products with variations - create separate order items for each variation
-          if (item.variations && Object.keys(item.variations).length > 0) {
-            for (const [variationId, variationData] of Object.entries(
-              item.variations
-            )) {
-              const variation = await prismadb.productVariation.findUnique({
-                where: {
-                  id: variationId
-                }
-              })
+        if (validItems.length > 0) {
+          await tx.orderItem.createMany({
+            data: validItems.map((item) => ({
+              orderId: order.id,
+              productId: item.productId,
+              productVariationId: item.variationId,
+              quantity: item.quantity,
+              priceInCents: item.unitPriceInCents,
+              name: item.name,
+              weight: item.weight || 0
+            }))
+          })
+        }
 
-              if (variation) {
-                // Create order item for this specific variation
-                const orderItem = await prismadb.orderItem.create({
-                  data: {
-                    orderId: order.id,
-                    productId: productId,
-                    productVariationId: variationId,
-                    quantity: variationData.cartQuantity,
-                    priceInCents: variationData.priceInCents,
-                    name: `${item.name} - ${variation.name}`,
-                    weight: item.weight || 0
-                  }
-                })
-                orderItems.push(orderItem)
-
-                // Reduce variation inventory. Done as a single atomic, clamped
-                // UPDATE (rather than reading variation.quantity and writing
-                // Math.max(0, ...) back) so two concurrent webhook deliveries
-                // for different orders can't both read the same quantity and
-                // both decrement from it, over-selling stock.
-                if (variation.quantity !== null) {
-                  await prismadb.$executeRawUnsafe(
-                    'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
-                    variationData.cartQuantity,
-                    variationId
-                  )
-                }
-              }
-            }
+        // Reduce inventory as a single atomic, clamped UPDATE per row (rather
+        // than reading quantity and writing Math.max(0, ...) back) so two
+        // concurrent webhook deliveries for different orders can't both read
+        // the same quantity and both decrement from it, over-selling stock.
+        // Quantities are aggregated per product/variation first in case a cart
+        // ever contains more than one line for the same one.
+        const productQuantities = new Map<string, number>()
+        const variationQuantities = new Map<string, number>()
+        for (const item of validItems) {
+          if (item.variationId) {
+            variationQuantities.set(item.variationId, (variationQuantities.get(item.variationId) || 0) + item.quantity)
           } else {
-            // Handle products without variations - create single order item
-            const orderItem = await prismadb.orderItem.create({
-              data: {
-                orderId: order.id,
-                productId: productId,
-                quantity: item.quantity,
-                priceInCents: item.priceInCents,
-                name: item.name,
-                weight: item.weight || 0
-              }
-            })
-            orderItems.push(orderItem)
-
-            // Update main product inventory. Done as a single atomic, clamped
-            // UPDATE (rather than reading product.quantity and writing
-            // Math.max(0, ...) back) so two concurrent webhook deliveries for
-            // different orders can't both read the same quantity and both
-            // decrement from it, over-selling stock.
-            if (product.quantity !== null) {
-              await prismadb.$executeRawUnsafe(
-                'UPDATE product SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
-                item.quantity,
-                productId
-              )
-            }
+            productQuantities.set(item.productId, (productQuantities.get(item.productId) || 0) + item.quantity)
           }
         }
-      }
+
+        for (const [productId, quantity] of Array.from(productQuantities)) {
+          await tx.$executeRawUnsafe(
+            'UPDATE product SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+            quantity,
+            productId
+          )
+        }
+        for (const [variationId, quantity] of Array.from(variationQuantities)) {
+          await tx.$executeRawUnsafe(
+            'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+            quantity,
+            variationId
+          )
+        }
+
+        return order
+      })
 
       // Customer info is stored in the order itself, no separate customer table
 

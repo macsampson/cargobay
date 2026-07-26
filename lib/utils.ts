@@ -46,6 +46,25 @@ export interface ProductSaleInfo {
   hasActiveSale: boolean
 }
 
+export interface PercentageDiscountResult {
+  discountAmountInCents: number
+  finalPriceInCents: number
+}
+
+// Shared rounding rule for all percentage-based discounts (bundle tiers, sales):
+// round the discount amount to the nearest cent, then subtract. Keeping this in
+// one place guarantees bundle and sale discounts round identically.
+export const applyPercentageDiscount = (
+  baseAmountInCents: number,
+  percentage: number
+): PercentageDiscountResult => {
+  const discountAmountInCents = Math.round((baseAmountInCents * percentage) / 100)
+  return {
+    discountAmountInCents,
+    finalPriceInCents: Math.max(0, baseAmountInCents - discountAmountInCents)
+  }
+}
+
 export const calculateProductSalePrice = (
   originalPriceInCents: number,
   sales: SaleInfo[]
@@ -81,12 +100,11 @@ export const calculateProductSalePrice = (
     }
   }
 
-  const discountAmount = Math.round((originalPriceInCents * bestSale.percentage) / 100)
-  const salePriceInCents = originalPriceInCents - discountAmount
+  const { finalPriceInCents } = applyPercentageDiscount(originalPriceInCents, bestSale.percentage)
 
   return {
     originalPriceInCents,
-    salePriceInCents: Math.max(0, salePriceInCents), // Ensure price doesn't go negative
+    salePriceInCents: finalPriceInCents,
     discountPercentage: bestSale.percentage,
     sale: bestSale,
     hasActiveSale: true

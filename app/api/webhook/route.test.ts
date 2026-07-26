@@ -33,6 +33,9 @@ describe('POST /api/webhook', () => {
       stripeEventId: 'evt_1',
       createdAt: new Date()
     })
+    prismaMock.product.findMany.mockResolvedValue([])
+    prismaMock.productVariation.findMany.mockResolvedValue([])
+    prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock))
   })
 
   it('rejects requests with an invalid Stripe signature', async () => {
@@ -60,14 +63,18 @@ describe('POST /api/webhook', () => {
   })
 
   it('creates an order and order items, and decrements inventory, on a completed checkout session', async () => {
-    const cartItems = {
-      'product-1': {
-        name: 'Widget',
-        category: 'misc',
+    const cartItems = [
+      {
+        productId: 'product-1',
+        variationId: null,
         quantity: 2,
-        priceInCents: 1500
+        name: 'Widget',
+        weight: 1,
+        unitPriceInCents: 1500,
+        discountType: 'none',
+        discountId: null
       }
-    }
+    ]
 
     constructEventMock.mockReturnValue({
       id: 'evt_1',
@@ -109,11 +116,8 @@ describe('POST /api/webhook', () => {
     })
 
     prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
-    prismaMock.product.findUnique.mockResolvedValue({
-      id: 'product-1',
-      quantity: 10
-    })
-    prismaMock.orderItem.create.mockResolvedValue({ id: 'item-1' })
+    prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 10 }])
+    prismaMock.orderItem.createMany.mockResolvedValue({ count: 1 })
     prismaMock.$executeRawUnsafe.mockResolvedValue(1)
 
     const response = await POST(makeRequest('{}'))
@@ -126,17 +130,16 @@ describe('POST /api/webhook', () => {
         totalPriceInCents: 3000
       })
     })
-    expect(prismaMock.orderItem.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        orderId: 'order-1',
-        productId: 'product-1',
-        quantity: 2,
-        priceInCents: 1500
-      })
+    expect(prismaMock.orderItem.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({
+          orderId: 'order-1',
+          productId: 'product-1',
+          quantity: 2,
+          priceInCents: 1500
+        })
+      ]
     })
-    // Inventory is decremented via a single atomic, clamped SQL UPDATE rather
-    // than a read-then-write, to avoid a lost-update race under concurrent
-    // webhook deliveries for different orders touching the same product.
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
       'UPDATE product SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
       2,
@@ -144,50 +147,142 @@ describe('POST /api/webhook', () => {
     )
   })
 
-  it('returns 500 if order processing throws', async () => {
+  it('persists the unitPriceInCents from checkout metadata verbatim, never recomputing against live bundle/sale state', async () => {
+    // Even though this simulates bundle/sale rules having since changed (irrelevant
+    // here because the webhook never re-reads Bundle/Sale at all), the persisted
+    // price must be exactly what checkout locked in with Stripe.
+    const cartItems = [
+      {
+        productId: 'product-1',
+        variationId: null,
+        quantity: 5,
+        name: 'Widget',
+        weight: 1,
+        unitPriceInCents: 850, // was the 15%-off bundle price at checkout time
+        discountType: 'bundle',
+        discountId: 'bundle-1'
+      }
+    ]
+
     constructEventMock.mockReturnValue({
       id: 'evt_1',
       type: 'checkout.session.completed',
       data: {
         object: {
           id: 'sess_1',
-          metadata: {
-            storeId: 'store-1',
-            cartItems: JSON.stringify({})
-          }
+          amount_total: 4250,
+          metadata: { storeId: 'store-1', cartItems: JSON.stringify(cartItems) }
         }
       }
     })
-    prismaMock.order.create.mockRejectedValue(new Error('db down'))
+
+    prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
+    prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 10 }])
+    prismaMock.orderItem.createMany.mockResolvedValue({ count: 1 })
+    prismaMock.$executeRawUnsafe.mockResolvedValue(1)
+
+    const response = await POST(makeRequest('{}'))
+
+    expect(response.status).toBe(200)
+    expect(prismaMock.orderItem.createMany).toHaveBeenCalledWith({
+      data: [expect.objectContaining({ priceInCents: 850 })]
+    })
+  })
+
+  it('wraps order + order items + inventory decrement in a single transaction', async () => {
+    const cartItems = [
+      { productId: 'product-1', variationId: null, quantity: 1, name: 'Widget', weight: 1, unitPriceInCents: 1000, discountType: 'none', discountId: null }
+    ]
+
+    constructEventMock.mockReturnValue({
+      id: 'evt_1',
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: 'sess_1',
+          amount_total: 1000,
+          metadata: { storeId: 'store-1', cartItems: JSON.stringify(cartItems) }
+        }
+      }
+    })
+
+    prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
+    prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 10 }])
+    prismaMock.orderItem.createMany.mockResolvedValue({ count: 1 })
+    prismaMock.$executeRawUnsafe.mockResolvedValue(1)
+
+    await POST(makeRequest('{}'))
+
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(1)
+  })
+
+  it('rolls back (returns 500, order not treated as created) when a write inside the transaction fails', async () => {
+    const cartItems = [
+      { productId: 'product-1', variationId: null, quantity: 1, name: 'Widget', weight: 1, unitPriceInCents: 1000, discountType: 'none', discountId: null }
+    ]
+
+    constructEventMock.mockReturnValue({
+      id: 'evt_1',
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: 'sess_1',
+          amount_total: 1000,
+          metadata: { storeId: 'store-1', cartItems: JSON.stringify(cartItems) }
+        }
+      }
+    })
+
+    prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
+    prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 10 }])
+    prismaMock.orderItem.createMany.mockRejectedValue(new Error('db error mid-transaction'))
 
     const response = await POST(makeRequest('{}'))
 
     expect(response.status).toBe(500)
+    expect(prismaMock.$executeRawUnsafe).not.toHaveBeenCalled()
   })
 
-  it('creates one order item per variation and decrements each variation quantity', async () => {
-    const cartItems = {
-      'product-1': {
-        name: 'Shirt',
-        category: 'apparel',
-        quantity: 1,
-        priceInCents: 0,
-        variations: {
-          'var-1': {
-            name: 'Red / M',
-            priceInCents: 2000,
-            cartQuantity: 3,
-            inventoryAmount: 10
-          },
-          'var-2': {
-            name: 'Blue / L',
-            priceInCents: 2200,
-            cartQuantity: 1,
-            inventoryAmount: 2
-          }
+  it('looks up products and variations in a single batched query each, not once per cart line', async () => {
+    const cartItems = [
+      { productId: 'p1', variationId: null, quantity: 1, name: 'A', weight: 1, unitPriceInCents: 100, discountType: 'none', discountId: null },
+      { productId: 'p2', variationId: 'v1', quantity: 1, name: 'B', weight: 1, unitPriceInCents: 200, discountType: 'none', discountId: null },
+      { productId: 'p3', variationId: null, quantity: 1, name: 'C', weight: 1, unitPriceInCents: 300, discountType: 'none', discountId: null }
+    ]
+
+    constructEventMock.mockReturnValue({
+      id: 'evt_1',
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: 'sess_1',
+          amount_total: 600,
+          metadata: { storeId: 'store-1', cartItems: JSON.stringify(cartItems) }
         }
       }
-    }
+    })
+
+    prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
+    prismaMock.product.findMany.mockResolvedValue([
+      { id: 'p1', quantity: 10 },
+      { id: 'p2', quantity: 10 },
+      { id: 'p3', quantity: 10 }
+    ])
+    prismaMock.productVariation.findMany.mockResolvedValue([{ id: 'v1', quantity: 10 }])
+    prismaMock.orderItem.createMany.mockResolvedValue({ count: 3 })
+    prismaMock.$executeRawUnsafe.mockResolvedValue(1)
+
+    await POST(makeRequest('{}'))
+
+    expect(prismaMock.product.findMany).toHaveBeenCalledTimes(1)
+    expect(prismaMock.productVariation.findMany).toHaveBeenCalledTimes(1)
+  })
+
+  it('creates one order item per variation line and decrements each variation quantity independently', async () => {
+    const cartItems = [
+      { productId: 'product-1', variationId: 'var-1', quantity: 3, name: 'Shirt - Red / M', weight: 1, unitPriceInCents: 2000, discountType: 'none', discountId: null },
+      { productId: 'product-1', variationId: 'var-2', quantity: 1, name: 'Shirt - Blue / L', weight: 1, unitPriceInCents: 2200, discountType: 'none', discountId: null }
+    ]
 
     constructEventMock.mockReturnValue({
       id: 'evt_1',
@@ -196,38 +291,28 @@ describe('POST /api/webhook', () => {
         object: {
           id: 'sess_1',
           amount_total: 8200,
-          metadata: {
-            storeId: 'store-1',
-            cartItems: JSON.stringify(cartItems)
-          }
+          metadata: { storeId: 'store-1', cartItems: JSON.stringify(cartItems) }
         }
       }
     })
 
     prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
-    prismaMock.product.findUnique.mockResolvedValue({ id: 'product-1', quantity: 10 })
-    prismaMock.productVariation.findUnique.mockImplementation(({ where }: any) => {
-      const variations: Record<string, any> = {
-        'var-1': { id: 'var-1', name: 'Red / M', quantity: 10 },
-        'var-2': { id: 'var-2', name: 'Blue / L', quantity: 2 }
-      }
-      return Promise.resolve(variations[where.id])
-    })
-    prismaMock.orderItem.create.mockResolvedValue({ id: 'item-1' })
+    prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 10 }])
+    prismaMock.productVariation.findMany.mockResolvedValue([
+      { id: 'var-1', name: 'Red / M', quantity: 10 },
+      { id: 'var-2', name: 'Blue / L', quantity: 2 }
+    ])
+    prismaMock.orderItem.createMany.mockResolvedValue({ count: 2 })
     prismaMock.$executeRawUnsafe.mockResolvedValue(1)
 
     const response = await POST(makeRequest('{}'))
 
     expect(response.status).toBe(200)
-    expect(prismaMock.orderItem.create).toHaveBeenCalledTimes(2)
-    expect(prismaMock.orderItem.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        productId: 'product-1',
-        productVariationId: 'var-1',
-        quantity: 3,
-        priceInCents: 2000,
-        name: 'Shirt - Red / M'
-      })
+    expect(prismaMock.orderItem.createMany).toHaveBeenCalledWith({
+      data: [
+        expect.objectContaining({ productId: 'product-1', productVariationId: 'var-1', quantity: 3, priceInCents: 2000, name: 'Shirt - Red / M' }),
+        expect.objectContaining({ productId: 'product-1', productVariationId: 'var-2', quantity: 1, priceInCents: 2200, name: 'Shirt - Blue / L' })
+      ]
     })
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
       'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
@@ -244,59 +329,10 @@ describe('POST /api/webhook', () => {
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledTimes(2)
   })
 
-  it('floors variation inventory at 0 when cart quantity exceeds stock', async () => {
-    const cartItems = {
-      'product-1': {
-        name: 'Shirt',
-        category: 'apparel',
-        quantity: 1,
-        priceInCents: 0,
-        variations: {
-          'var-1': {
-            name: 'Red / M',
-            priceInCents: 2000,
-            cartQuantity: 5,
-            inventoryAmount: 2
-          }
-        }
-      }
-    }
-
-    constructEventMock.mockReturnValue({
-      id: 'evt_1',
-      type: 'checkout.session.completed',
-      data: {
-        object: {
-          id: 'sess_1',
-          amount_total: 10000,
-          metadata: { storeId: 'store-1', cartItems: JSON.stringify(cartItems) }
-        }
-      }
-    })
-
-    prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
-    prismaMock.product.findUnique.mockResolvedValue({ id: 'product-1', quantity: 10 })
-    prismaMock.productVariation.findUnique.mockResolvedValue({ id: 'var-1', name: 'Red / M', quantity: 2 })
-    prismaMock.orderItem.create.mockResolvedValue({ id: 'item-1' })
-    prismaMock.$executeRawUnsafe.mockResolvedValue(1)
-
-    const response = await POST(makeRequest('{}'))
-
-    expect(response.status).toBe(200)
-    // The floor-at-zero clamping (GREATEST(quantity - $1, 0)) happens inside
-    // the SQL itself now, so this asserts the query is issued with the raw
-    // requested cart quantity — the database does the clamping.
-    expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
-      'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
-      5,
-      'var-1'
-    )
-  })
-
-  it('floors main product inventory at 0 when cart quantity exceeds stock', async () => {
-    const cartItems = {
-      'product-1': { name: 'Widget', category: 'misc', quantity: 5, priceInCents: 1500 }
-    }
+  it('floors inventory at 0 when cart quantity exceeds stock (clamped in SQL, not app code)', async () => {
+    const cartItems = [
+      { productId: 'product-1', variationId: null, quantity: 5, name: 'Widget', weight: 1, unitPriceInCents: 1500, discountType: 'none', discountId: null }
+    ]
 
     constructEventMock.mockReturnValue({
       id: 'evt_1',
@@ -311,8 +347,8 @@ describe('POST /api/webhook', () => {
     })
 
     prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
-    prismaMock.product.findUnique.mockResolvedValue({ id: 'product-1', quantity: 2 })
-    prismaMock.orderItem.create.mockResolvedValue({ id: 'item-1' })
+    prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 2 }])
+    prismaMock.orderItem.createMany.mockResolvedValue({ count: 1 })
     prismaMock.$executeRawUnsafe.mockResolvedValue(1)
 
     const response = await POST(makeRequest('{}'))
@@ -325,10 +361,10 @@ describe('POST /api/webhook', () => {
     )
   })
 
-  it('skips cart items whose product no longer exists, without creating an order item', async () => {
-    const cartItems = {
-      'missing-product': { name: 'Ghost', category: 'misc', quantity: 1, priceInCents: 500 }
-    }
+  it('skips cart lines whose product no longer exists, without creating an order item for them', async () => {
+    const cartItems = [
+      { productId: 'missing-product', variationId: null, quantity: 1, name: 'Ghost', weight: 1, unitPriceInCents: 500, discountType: 'none', discountId: null }
+    ]
 
     constructEventMock.mockReturnValue({
       id: 'evt_1',
@@ -343,13 +379,34 @@ describe('POST /api/webhook', () => {
     })
 
     prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
-    prismaMock.product.findUnique.mockResolvedValue(null)
+    prismaMock.product.findMany.mockResolvedValue([])
 
     const response = await POST(makeRequest('{}'))
 
     expect(response.status).toBe(200)
-    expect(prismaMock.orderItem.create).not.toHaveBeenCalled()
+    expect(prismaMock.orderItem.createMany).not.toHaveBeenCalled()
     expect(prismaMock.$executeRawUnsafe).not.toHaveBeenCalled()
+  })
+
+  it('returns 500 if order processing throws', async () => {
+    constructEventMock.mockReturnValue({
+      id: 'evt_1',
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: 'sess_1',
+          metadata: {
+            storeId: 'store-1',
+            cartItems: JSON.stringify([])
+          }
+        }
+      }
+    })
+    prismaMock.order.create.mockRejectedValue(new Error('db down'))
+
+    const response = await POST(makeRequest('{}'))
+
+    expect(response.status).toBe(500)
   })
 
   it('returns 200 without processing an order for unrelated Stripe event types', async () => {
@@ -376,7 +433,7 @@ describe('POST /api/webhook', () => {
           id: 'sess_1',
           metadata: {
             storeId: 'store-1',
-            cartItems: JSON.stringify({})
+            cartItems: JSON.stringify([])
           }
         }
       }

@@ -205,6 +205,17 @@ export async function PATCH(
       return new NextResponse('Product not found', { status: 404 })
     }
 
+    // Reject duplicate tier thresholds up front — the pricing engine resolves
+    // true duplicates deterministically (highest discount wins), but a
+    // duplicate minQuantity on save is almost always an admin mistake, so
+    // catch it here rather than let a dead tier persist silently.
+    const finalMinQuantities = [...bundlesToUpdate, ...bundlesToCreate].map(
+      (bundle: { minQuantity: number }) => bundle.minQuantity
+    )
+    if (new Set(finalMinQuantities).size !== finalMinQuantities.length) {
+      return new NextResponse('Bundle tiers must have unique minimum quantities', { status: 400 })
+    }
+
     const variationsToUpdate = variations.filter(
       (variation: { id: string }) => variation.id
     )
@@ -308,16 +319,6 @@ export async function PATCH(
     //   }
     // })
 
-    // Delete bundles that are no longer in the array
-    await prismadb.bundle.deleteMany({
-      where: {
-        productId: params.productId,
-        id: {
-          notIn: bundlesToUpdate.map((bundle: { id: string }) => bundle.id)
-        }
-      }
-    })
-
     for (const variation of variationsToUpdate) {
       await prismadb.productVariation.update({
         where: {
@@ -346,31 +347,43 @@ export async function PATCH(
       })
     }
 
-    // Update existing bundles
-    for (const bundle of bundlesToUpdate) {
-      await prismadb.bundle.update({
+    // Delete, update, and create bundle tiers as one atomic unit so a failure
+    // partway through can't leave tiers in a state that doesn't match what
+    // the admin submitted (e.g. deleted-but-not-recreated).
+    await prismadb.$transaction(async (tx) => {
+      await tx.bundle.deleteMany({
         where: {
-          id: bundle.id
-        },
-        data: {
-          minQuantity: bundle.minQuantity,
-          discountPercentage: bundle.discount
+          productId: params.productId,
+          id: {
+            notIn: bundlesToUpdate.map((bundle: { id: string }) => bundle.id)
+          }
         }
       })
-    }
 
-    // Create new bundles
-    if (bundlesToCreate.length > 0) {
-      await prismadb.bundle.createMany({
-        data: bundlesToCreate.map(
-          (bundle: { minQuantity: number; discount: number }) => ({
+      for (const bundle of bundlesToUpdate) {
+        await tx.bundle.update({
+          where: {
+            id: bundle.id
+          },
+          data: {
             minQuantity: bundle.minQuantity,
-            discountPercentage: bundle.discount,
-            productId: params.productId
-          })
-        )
-      })
-    }
+            discountPercentage: bundle.discount
+          }
+        })
+      }
+
+      if (bundlesToCreate.length > 0) {
+        await tx.bundle.createMany({
+          data: bundlesToCreate.map(
+            (bundle: { minQuantity: number; discount: number }) => ({
+              minQuantity: bundle.minQuantity,
+              discountPercentage: bundle.discount,
+              productId: params.productId
+            })
+          )
+        })
+      }
+    })
 
     // Create new images
     // if (imagesWithUuid.length > 0) {

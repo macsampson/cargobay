@@ -1,10 +1,11 @@
 // Import necessary dependencies and types
-import { ProductVariation } from '@prisma/client'
 import { NextResponse } from 'next/server'
 import prismadb from '@/lib/prismadb'
 import { logger } from '@/lib/logger'
 import { getShippoApiKey, getChitchatsConfig } from '@/lib/shipping-config'
 import { createShippoShipment, ShippoRate } from '@/lib/shippo'
+import { calculateAuthoritativeUnitPrice, type BundleTier } from '@/lib/pricing'
+import type { SaleInfo } from '@/lib/utils'
 
 // Helper function to format prices from cents to dollars with 2 decimal places
 const formatPrice = (priceInCents: number): string => {
@@ -24,16 +25,20 @@ type AddressType = {
   phone?: string
 }
 
+// Only identity + quantity are trusted from the client — price is resolved
+// server-side (bundle tier / sale, same as checkout/route.ts) so a spoofed
+// `bundlePrice` can't under-declare what gets charged for shipping OR the
+// customs/insurance declared value below. `weight` remains client-supplied
+// for now — a separate, lower-severity trust gap tracked as a follow-up.
 type CartItemType = {
-  id: string
+  productId: string
+  variationId?: string
   name: string
-  priceInCents: number
   weight: string
-  bundles: { minQuantity: number; discountPercentage: number }[]
   cartQuantity: number
-  variations: Record<string, ProductVariation>
-  bundlePrice?: number
 }
+
+type PricedCartItem = CartItemType & { unitPriceInCents: number }
 
 type CustomsDeclarationInfo = {
   items: {
@@ -64,39 +69,96 @@ export async function POST(req: Request) {
     const url = new URL(req.url)
     const storeId = url.pathname.split('/')[2]
 
+    // Batched lookups — one round trip regardless of cart size — to resolve
+    // each line's authoritative unit price server-side instead of trusting
+    // the client's bundlePrice/priceInCents.
+    const productIds = Array.from(new Set(cartItems.map((item) => item.productId)))
+    const now = new Date()
+
+    const [products, activeSales] = await Promise.all([
+      prismadb.product.findMany({
+        where: { id: { in: productIds }, storeId },
+        include: { bundles: true, variations: true }
+      }),
+      prismadb.sale.findMany({
+        where: { storeId, isActive: true, startDate: { lte: now }, endDate: { gte: now } },
+        include: { products: { select: { productId: true } } }
+      })
+    ])
+    const productById = new Map(products.map((p) => [p.id, p]))
+
+    const pricedCartItems: PricedCartItem[] = []
+    for (const item of cartItems) {
+      const product = productById.get(item.productId)
+      if (!product) {
+        return NextResponse.json(
+          { success: false, error: `Product ${item.productId} is not available` },
+          { status: 400 }
+        )
+      }
+
+      let variation = null
+      if (item.variationId) {
+        variation = product.variations.find((v) => v.id === item.variationId) ?? null
+        if (!variation) {
+          return NextResponse.json(
+            { success: false, error: `Variation ${item.variationId} not found for product ${item.productId}` },
+            { status: 400 }
+          )
+        }
+      }
+
+      const baseUnitPriceInCents = variation ? variation.priceInCents : product.priceInCents
+      const bundleTiers: BundleTier[] = product.bundles.map((b) => ({
+        id: b.id,
+        minQuantity: b.minQuantity,
+        discountPercentage: b.discountPercentage
+      }))
+
+      let applicableSales: SaleInfo[] = []
+      if (product.quantity !== 0) {
+        const productSpecificSales = activeSales.filter(
+          (sale) => !sale.isStoreWide && sale.products.some((sp) => sp.productId === product.id)
+        )
+        const storeWideSales = activeSales.filter((sale) => sale.isStoreWide)
+        applicableSales = [...productSpecificSales, ...storeWideSales].map((sale) => ({
+          id: sale.id,
+          name: sale.name,
+          percentage: sale.percentage,
+          startDate: sale.startDate,
+          endDate: sale.endDate,
+          isActive: sale.isActive,
+          isStoreWide: sale.isStoreWide
+        }))
+      }
+
+      const { unitPriceInCents } = calculateAuthoritativeUnitPrice(
+        baseUnitPriceInCents,
+        item.cartQuantity,
+        bundleTiers,
+        applicableSales
+      )
+
+      pricedCartItems.push({ ...item, unitPriceInCents })
+    }
+
     // Calculate total weight and price
-    const totalWeight = cartItems.reduce(
+    const totalWeight = pricedCartItems.reduce(
       (acc, cartItem) => acc + Number(cartItem.weight) * cartItem.cartQuantity,
       0
     )
 
-    const totalPrice = cartItems.reduce((acc, cartItem) => {
-      // logger.info(cartItem)
-
-      // Use bundlePrice if available (already calculated by frontend), otherwise calculate from base price
-      if (cartItem.bundlePrice) {
-        // logger.info('USING BUNDLE PRICE: ', cartItem.bundlePrice)
-        return acc + cartItem.bundlePrice
-      }
-
-      const itemPrice = cartItem.priceInCents * cartItem.cartQuantity
-      // logger.info('USING ITEM PRICE: ', itemPrice)
-      // logger.info('PRICE: ', cartItem.priceInCents)
-      // logger.info('QUANTITY: ', cartItem.cartQuantity)
-
-      return acc + itemPrice
-    }, 0)
-
-    // logger.info('TOTAL PRICE: ', totalPrice)
+    const totalPrice = pricedCartItems.reduce(
+      (acc, cartItem) => acc + cartItem.unitPriceInCents * cartItem.cartQuantity,
+      0
+    )
 
     // Create line items for Shippo
-    const lineItems = cartItems.map((cartItem) => ({
+    const lineItems = pricedCartItems.map((cartItem) => ({
       title: cartItem.name,
-      sku: cartItem.id,
+      sku: cartItem.productId,
       quantity: cartItem.cartQuantity,
-      total_price: formatPrice(
-        cartItem.bundlePrice || cartItem.priceInCents * cartItem.cartQuantity
-      ),
+      total_price: formatPrice(cartItem.unitPriceInCents * cartItem.cartQuantity),
       currency: currency,
       weight: (Number(cartItem.weight) * cartItem.cartQuantity).toString(),
       weight_unit: 'g',
@@ -283,15 +345,12 @@ export async function POST(req: Request) {
               is_insurance_requested: true,
               ship_date: 'today',
               hs_tariff_code: customsDeclarationInfo.items[0].tariff_number,
-              line_items: cartItems.map((cartItem) => ({
+              line_items: pricedCartItems.map((cartItem) => ({
                 quantity: cartItem.cartQuantity || 1,
                 description: cartItem.name || 'Keycap',
                 currency_code: currency,
                 value_amount:
-                  (
-                    (cartItem.bundlePrice ||
-                      cartItem.priceInCents * cartItem.cartQuantity) / 100
-                  )?.toString() || '0',
+                  ((cartItem.unitPriceInCents * cartItem.cartQuantity) / 100)?.toString() || '0',
                 weight: cartItem.weight?.toString() || '1',
                 weight_unit: customsDeclarationInfo.items[0].mass_unit,
                 origin_country: customsDeclarationInfo.items[0].origin_country,

@@ -126,6 +126,7 @@ describe('PATCH /api/[storeId]/products/[productId]', () => {
     prismaMock.image.update.mockResolvedValue({})
     prismaMock.image.createMany.mockResolvedValue({ count: 0 })
     prismaMock.bundle.deleteMany.mockResolvedValue({ count: 0 })
+    prismaMock.$transaction.mockImplementation((cb: any) => cb(prismaMock))
   })
 
   it('converts the dollar price to cents when updating', async () => {
@@ -339,6 +340,76 @@ describe('PATCH /api/[storeId]/products/[productId]', () => {
       baseParams
     )
 
+    expect(prismaMock.bundle.createMany).not.toHaveBeenCalled()
+  })
+
+  it('performs bundle deletes/updates/creates inside a single transaction', async () => {
+    prismaMock.bundle.update.mockResolvedValue({})
+    prismaMock.bundle.createMany.mockResolvedValue({ count: 1 })
+
+    await PATCH(
+      new Request('http://localhost/x', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...validBody,
+          bundles: [
+            { id: 'bundle-1', minQuantity: 3, discount: 10 },
+            { minQuantity: 5, discount: 15 }
+          ]
+        })
+      }),
+      baseParams
+    )
+
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(1)
+    expect(prismaMock.bundle.update).toHaveBeenCalled()
+    expect(prismaMock.bundle.createMany).toHaveBeenCalled()
+  })
+
+  it('returns 400 and writes nothing when two submitted bundles share a minQuantity', async () => {
+    const response = await PATCH(
+      new Request('http://localhost/x', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...validBody,
+          bundles: [
+            { id: 'bundle-1', minQuantity: 5, discount: 10 },
+            { minQuantity: 5, discount: 20 }
+          ]
+        })
+      }),
+      baseParams
+    )
+
+    expect(response.status).toBe(400)
+    expect(prismaMock.$transaction).not.toHaveBeenCalled()
+    expect(prismaMock.bundle.update).not.toHaveBeenCalled()
+    expect(prismaMock.bundle.createMany).not.toHaveBeenCalled()
+  })
+
+  it('rolls back bundle changes when a write partway through the transaction fails', async () => {
+    prismaMock.$transaction.mockImplementation(async (cb: any) => {
+      try {
+        return await cb(prismaMock)
+      } catch (error) {
+        throw error
+      }
+    })
+    prismaMock.bundle.update.mockRejectedValue(new Error('db error mid-transaction'))
+
+    const response = await PATCH(
+      new Request('http://localhost/x', {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...validBody,
+          bundles: [{ id: 'bundle-1', minQuantity: 3, discount: 10 }]
+        })
+      }),
+      baseParams
+    )
+
+    expect(response.status).toBe(500)
+    // The failure inside the transaction must not resolve the request as success.
     expect(prismaMock.bundle.createMany).not.toHaveBeenCalled()
   })
 
