@@ -29,7 +29,6 @@ describe('getConfigWarnings', () => {
       STRIPE_WEBHOOK_SECRET: 'whsec_test',
       BLOB_READ_WRITE_TOKEN: 'blob_token'
     }
-    delete process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME
     delete process.env.DISABLE_AUTH_FOR_LOCAL_DEV
     prismaMock.shippingSettings.findMany.mockResolvedValue([])
   })
@@ -95,14 +94,6 @@ describe('getConfigWarnings', () => {
 
     const warnings = await getConfigWarnings('store-1')
     expect(warnings.map((w) => w.key)).toContain('IMAGE_STORAGE')
-  })
-
-  it('does not warn about image storage when Cloudinary is configured instead of Blob', async () => {
-    delete process.env.BLOB_READ_WRITE_TOKEN
-    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME = 'my-cloud'
-
-    const warnings = await getConfigWarnings('store-1')
-    expect(warnings.map((w) => w.key)).not.toContain('IMAGE_STORAGE')
   })
 
   it('warns when a shipping API key is stored but encryption is not configured', async () => {

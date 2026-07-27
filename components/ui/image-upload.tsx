@@ -1,6 +1,5 @@
 'use client'
 
-import { CldUploadWidget } from 'next-cloudinary'
 import { upload } from '@vercel/blob/client'
 import { useEffect, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
@@ -47,17 +46,6 @@ const ImageUpload: React.FC<ImageUploadProps> = ({
     }
     return a.url.localeCompare(b.url)
   })
-
-  const onUpload = (result: any) => {
-    const maxOrdering =
-      value.length > 0 ? Math.max(...value.map((img) => img.ordering)) : -1
-    const newImage = {
-      url: result.info.secure_url,
-      credit: '',
-      ordering: maxOrdering + 1
-    }
-    onChange([...value, newImage])
-  }
 
   const handleBlobFilesSelected = async (
     e: React.ChangeEvent<HTMLInputElement>
@@ -144,19 +132,11 @@ const ImageUpload: React.FC<ImageUploadProps> = ({
     return null
   }
 
-  // Vercel Blob is the default storage backend when its token is provisioned
-  // (e.g. via the "Deploy to Vercel" button's bundled Blob store) — see
+  // Vercel Blob is the storage backend when its token is provisioned (e.g. via
+  // the "Deploy to Vercel" button's bundled Blob store) — see
   // NEXT_PUBLIC_BLOB_ENABLED in next.config.js, which mirrors the server-only
   // BLOB_READ_WRITE_TOKEN at build time so the client can branch on it.
-  // Cloudinary remains a legacy fallback for instances that predate Blob support.
   const blobConfigured = process.env.NEXT_PUBLIC_BLOB_ENABLED === 'true'
-
-  // CldUploadWidget throws synchronously during render if this is unset — not
-  // on click — which would otherwise crash the whole product form. Guard it
-  // the same way the demo-mode branch below guards against mounting the widget.
-  const cloudinaryConfigured = Boolean(
-    process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME
-  )
 
   return (
     <div className="space-y-4">
@@ -245,11 +225,6 @@ const ImageUpload: React.FC<ImageUploadProps> = ({
       )}
 
       {isPublicDemoModeEnabled() ? (
-        // Uploads go straight from the browser to Cloudinary — they never hit our
-        // /api/... routes, so the demo-mode write-block in middleware.ts can't see
-        // them. Don't even mount the upload widget here rather than rely on `disabled`
-        // alone, since that's just a button attribute, not something that stops a
-        // determined visitor from triggering the widget another way.
         <Button
           type="button"
           disabled
@@ -288,7 +263,7 @@ const ImageUpload: React.FC<ImageUploadProps> = ({
             </div>
           </Button>
         </>
-      ) : !cloudinaryConfigured ? (
+      ) : (
         <Button
           type="button"
           disabled
@@ -298,36 +273,10 @@ const ImageUpload: React.FC<ImageUploadProps> = ({
           <div className="flex flex-col items-center space-y-2">
             <ImagePlus className="h-8 w-8 text-muted-foreground" />
             <span className="text-sm text-muted-foreground text-center px-4">
-              Image upload not configured — add a Blob store, or set
-              NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME
+              Image upload not configured — add a Blob store
             </span>
           </div>
         </Button>
-      ) : (
-        <CldUploadWidget onUpload={onUpload} uploadPreset="ivwjxqjz">
-          {({ open }) => {
-            const onClick = () => {
-              open()
-            }
-
-            return (
-              <Button
-                type="button"
-                disabled={disabled}
-                variant="outline"
-                onClick={onClick}
-                className="h-32 w-full border-2 border-dashed border-muted-foreground/25 hover:border-primary/50 transition-colors"
-              >
-                <div className="flex flex-col items-center space-y-2">
-                  <ImagePlus className="h-8 w-8 text-muted-foreground" />
-                  <span className="text-sm text-muted-foreground">
-                    Add Images
-                  </span>
-                </div>
-              </Button>
-            )
-          }}
-        </CldUploadWidget>
       )}
     </div>
   )

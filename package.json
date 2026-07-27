@@ -16,8 +16,7 @@
     "deploy": "DIRECT_URL=\"${DIRECT_URL:-$DATABASE_URL_UNPOOLED}\" prisma migrate deploy",
     "migrate:rollback": "prisma migrate resolve --rolled-back",
     "seed-dev": "npx ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/seed-dev.ts",
-    "seed-demo": "npx ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/seed-demo.ts",
-    "migrate-cloudinary-to-blob": "npx ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/migrate-cloudinary-to-blob.ts"
+    "seed-demo": "npx ts-node --compiler-options '{\"module\":\"CommonJS\"}' prisma/seed-demo.ts"
   },
   "prisma": {
     "seed": "npx ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed-dev.ts"
@@ -46,7 +45,6 @@
     "iron-session": "^8.0.4",
     "lucide-react": "^0.286.0",
     "next": "^16.2.11",
-    "next-cloudinary": "^6.5.2",
     "next-themes": "^0.2.1",
     "node-cron": "^4.6.0",
     "pino": "^10.3.1",

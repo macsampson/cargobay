@@ -9,12 +9,11 @@ export function isDemoModeEnabled(): boolean {
   return process.env.DEMO_MODE === 'true'
 }
 
-// Client components can't read the server-only DEMO_MODE var. The Cloudinary upload
-// path in particular goes straight from the browser to Cloudinary — it never hits our
-// /api/... routes, so the middleware write-block (isDemoWriteBlocked) never sees it.
-// (Vercel Blob uploads do hit /api/upload and are covered by that block, but the
-// upload widget is still gated here too so it's never even mounted in demo mode.)
-// This is the one place client code needs to know demo mode is on, hence the
+// Client components can't read the server-only DEMO_MODE var. Vercel Blob uploads
+// go straight from the browser to Blob storage and hit /api/upload only for the
+// signed token, so they're covered by the middleware write-block (isDemoWriteBlocked),
+// but the upload widget is still gated here too so it's never even mounted in demo
+// mode. This is the one place client code needs to know demo mode is on, hence the
 // separate NEXT_PUBLIC_ var.
 export function isPublicDemoModeEnabled(): boolean {
   return process.env.NEXT_PUBLIC_DEMO_MODE === 'true'

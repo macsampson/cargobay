@@ -11,7 +11,7 @@ export interface ConfigWarning {
 /**
  * Surfaces operator-visible config gaps that fail silently otherwise: middleware
  * falls back to a placeholder CORS origin, auth falls back to a hardcoded session
- * secret, and Stripe/Cloudinary just throw wherever they're first used. Node-only
+ * secret, and Stripe just throws wherever it's first used. Node-only
  * (queries the database) — don't import this into middleware.ts, see lib/demo-mode.ts.
  *
  * Pass a storeId to scope the shipping-provider checks to one store (e.g. from the
@@ -50,10 +50,10 @@ export async function getConfigWarnings(storeId?: string): Promise<ConfigWarning
     })
   }
 
-  if (!process.env.BLOB_READ_WRITE_TOKEN && !process.env.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME) {
+  if (!process.env.BLOB_READ_WRITE_TOKEN) {
     warnings.push({
       key: 'IMAGE_STORAGE',
-      message: 'No image storage is configured — image uploads will fail. Add a Vercel Blob store, or set NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME for the legacy Cloudinary integration.'
+      message: 'No image storage is configured — image uploads will fail. Add a Vercel Blob store.'
     })
   }
 
