@@ -4,6 +4,29 @@ import { NextResponse } from 'next/server'
 import { isAuthenticated } from '@/lib/auth'
 import { CarouselImage } from '@prisma/client'
 import { logger } from '@/lib/logger'
+import axios from 'axios'
+
+const REVALIDATE_URL = process.env.FRONTEND_STORE_URL + '/api/revalidate'
+
+// Don't await this - let it run in the background. Mirrors the same
+// fire-and-forget pattern in products/[productId]/route.ts.
+function revalidateCarousel() {
+  if (!process.env.FRONTEND_STORE_URL || !process.env.REVALIDATE_TOKEN) return
+
+  axios.post(
+    REVALIDATE_URL,
+    { tag: 'carousel' },
+    {
+      timeout: 5000,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.REVALIDATE_TOKEN}`
+      }
+    }
+  ).catch(() => {
+    // Silently ignore revalidation failures - the frontend will eventually sync on next request
+  })
+}
 
 export async function GET(req: Request, props: { params: Promise<{ storeId: string }> }) {
   const params = await props.params;
@@ -54,6 +77,8 @@ export async function POST(req: Request, props: { params: Promise<{ storeId: str
       }))
     })
 
+    revalidateCarousel()
+
     return NextResponse.json(carouselImages)
   } catch (error) {
     logger.info('[CAROUSEL_IMAGES_POST]', error)
@@ -90,6 +115,8 @@ export async function PATCH(req: Request, props: { params: Promise<{ storeId: st
         imageCredit: image.imageCredit
       }))
     })
+
+    revalidateCarousel()
 
     return NextResponse.json(carouselImages)
   } catch (error) {

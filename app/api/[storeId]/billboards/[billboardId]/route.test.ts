@@ -1,11 +1,14 @@
 import { GET, PATCH, DELETE } from './route'
 import prismadb from '@/lib/prismadb'
 import { isAuthenticated } from '@/lib/auth'
+import axios from 'axios'
 
 jest.mock('@/lib/auth')
+jest.mock('axios', () => ({ post: jest.fn(() => Promise.resolve()) }))
 
 const prismaMock = prismadb as any
 const authMock = isAuthenticated as jest.Mock
+const axiosPostMock = axios.post as jest.Mock
 
 const baseParams = { params: Promise.resolve({ storeId: 'store-1', billboardId: 'b1' }) }
 
@@ -84,6 +87,24 @@ describe('PATCH /api/[storeId]/billboards/[billboardId]', () => {
     const response = await PATCH(makeRequest('PATCH', { imageUrl: 'https://x/1.png' }), baseParams)
     expect(response.status).toBe(500)
   })
+
+  it('fires a fire-and-forget revalidation request when FRONTEND_STORE_URL and REVALIDATE_TOKEN are set', async () => {
+    process.env.FRONTEND_STORE_URL = 'https://storefront.example.com'
+    process.env.REVALIDATE_TOKEN = 'revalidate-secret'
+
+    await PATCH(makeRequest('PATCH', { imageUrl: 'https://x/1.png' }), baseParams)
+
+    expect(axiosPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/revalidate'),
+      { tag: 'billboards' },
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer revalidate-secret' })
+      })
+    )
+
+    delete process.env.FRONTEND_STORE_URL
+    delete process.env.REVALIDATE_TOKEN
+  })
 })
 
 describe('DELETE /api/[storeId]/billboards/[billboardId]', () => {
@@ -119,5 +140,24 @@ describe('DELETE /api/[storeId]/billboards/[billboardId]', () => {
 
     const response = await DELETE(makeRequest('DELETE'), baseParams)
     expect(response.status).toBe(500)
+  })
+
+  it('fires a fire-and-forget revalidation request when FRONTEND_STORE_URL and REVALIDATE_TOKEN are set', async () => {
+    process.env.FRONTEND_STORE_URL = 'https://storefront.example.com'
+    process.env.REVALIDATE_TOKEN = 'revalidate-secret'
+    prismaMock.billboard.deleteMany.mockResolvedValue({ count: 1 })
+
+    await DELETE(makeRequest('DELETE'), baseParams)
+
+    expect(axiosPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/revalidate'),
+      { tag: 'billboards' },
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer revalidate-secret' })
+      })
+    )
+
+    delete process.env.FRONTEND_STORE_URL
+    delete process.env.REVALIDATE_TOKEN
   })
 })

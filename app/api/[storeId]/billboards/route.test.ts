@@ -1,11 +1,14 @@
 import { POST, GET } from './route'
 import prismadb from '@/lib/prismadb'
 import { isAuthenticated } from '@/lib/auth'
+import axios from 'axios'
 
 jest.mock('@/lib/auth')
+jest.mock('axios', () => ({ post: jest.fn(() => Promise.resolve()) }))
 
 const prismaMock = prismadb as any
 const authMock = isAuthenticated as jest.Mock
+const axiosPostMock = axios.post as jest.Mock
 
 const baseParams = { params: Promise.resolve({ storeId: 'store-1' }) }
 
@@ -78,6 +81,35 @@ describe('POST /api/[storeId]/billboards', () => {
 
     const response = await POST(makeRequest({ label: 'Sale', imageUrl: 'https://x/1.png' }), baseParams)
     expect(response.status).toBe(500)
+  })
+
+  it('fires a fire-and-forget revalidation request when FRONTEND_STORE_URL and REVALIDATE_TOKEN are set', async () => {
+    process.env.FRONTEND_STORE_URL = 'https://storefront.example.com'
+    process.env.REVALIDATE_TOKEN = 'revalidate-secret'
+    prismaMock.billboard.create.mockResolvedValue({ id: 'b1' })
+
+    await POST(makeRequest({ label: 'Sale', imageUrl: 'https://x/1.png' }), baseParams)
+
+    expect(axiosPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/revalidate'),
+      { tag: 'billboards' },
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer revalidate-secret' })
+      })
+    )
+
+    delete process.env.FRONTEND_STORE_URL
+    delete process.env.REVALIDATE_TOKEN
+  })
+
+  it('does not attempt revalidation when FRONTEND_STORE_URL or REVALIDATE_TOKEN is missing', async () => {
+    delete process.env.FRONTEND_STORE_URL
+    delete process.env.REVALIDATE_TOKEN
+    prismaMock.billboard.create.mockResolvedValue({ id: 'b1' })
+
+    await POST(makeRequest({ label: 'Sale', imageUrl: 'https://x/1.png' }), baseParams)
+
+    expect(axiosPostMock).not.toHaveBeenCalled()
   })
 })
 

@@ -2,6 +2,29 @@ import { isAuthenticated } from '@/lib/auth'
 import { NextResponse } from "next/server"
 import prismadb from "@/lib/prismadb"
 import { logger } from '@/lib/logger'
+import axios from 'axios'
+
+const REVALIDATE_URL = process.env.FRONTEND_STORE_URL + '/api/revalidate'
+
+// Don't await this - let it run in the background. Mirrors the same
+// fire-and-forget pattern in products/[productId]/route.ts.
+function revalidateBillboards() {
+  if (!process.env.FRONTEND_STORE_URL || !process.env.REVALIDATE_TOKEN) return
+
+  axios.post(
+    REVALIDATE_URL,
+    { tag: 'billboards' },
+    {
+      timeout: 5000,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.REVALIDATE_TOKEN}`
+      }
+    }
+  ).catch(() => {
+    // Silently ignore revalidation failures - the frontend will eventually sync on next request
+  })
+}
 
 export async function POST(req: Request, props: { params: Promise<{ storeId: string }> }) {
   const params = await props.params;
@@ -69,6 +92,8 @@ export async function POST(req: Request, props: { params: Promise<{ storeId: str
     //     storeId: params.storeId,
     //   },
     // })
+
+    revalidateBillboards()
 
     return NextResponse.json(billboard)
   } catch (error) {

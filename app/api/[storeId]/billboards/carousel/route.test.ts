@@ -1,11 +1,14 @@
 import { GET, POST, PATCH } from './route'
 import prismadb from '@/lib/prismadb'
 import { isAuthenticated } from '@/lib/auth'
+import axios from 'axios'
 
 jest.mock('@/lib/auth')
+jest.mock('axios', () => ({ post: jest.fn(() => Promise.resolve()) }))
 
 const prismaMock = prismadb as any
 const authMock = isAuthenticated as jest.Mock
+const axiosPostMock = axios.post as jest.Mock
 
 const baseParams = { params: Promise.resolve({ storeId: 'store-1' }) }
 
@@ -80,6 +83,24 @@ describe('POST /api/[storeId]/billboards/carousel', () => {
     const response = await POST(makeRequest('POST', { images: [] }), baseParams)
     expect(response.status).toBe(500)
   })
+
+  it('fires a fire-and-forget revalidation request when FRONTEND_STORE_URL and REVALIDATE_TOKEN are set', async () => {
+    process.env.FRONTEND_STORE_URL = 'https://storefront.example.com'
+    process.env.REVALIDATE_TOKEN = 'revalidate-secret'
+
+    await POST(makeRequest('POST', { images: [{ imageUrl: 'https://x/1.png', imageCredit: '' }] }), baseParams)
+
+    expect(axiosPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/revalidate'),
+      { tag: 'carousel' },
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer revalidate-secret' })
+      })
+    )
+
+    delete process.env.FRONTEND_STORE_URL
+    delete process.env.REVALIDATE_TOKEN
+  })
 })
 
 describe('PATCH /api/[storeId]/billboards/carousel', () => {
@@ -108,5 +129,23 @@ describe('PATCH /api/[storeId]/billboards/carousel', () => {
   it('returns 400 when images is missing', async () => {
     const response = await PATCH(makeRequest('PATCH', {}), baseParams)
     expect(response.status).toBe(400)
+  })
+
+  it('fires a fire-and-forget revalidation request when FRONTEND_STORE_URL and REVALIDATE_TOKEN are set', async () => {
+    process.env.FRONTEND_STORE_URL = 'https://storefront.example.com'
+    process.env.REVALIDATE_TOKEN = 'revalidate-secret'
+
+    await PATCH(makeRequest('PATCH', { images: [{ imageUrl: 'https://x/2.png', imageCredit: '' }] }), baseParams)
+
+    expect(axiosPostMock).toHaveBeenCalledWith(
+      expect.stringContaining('/api/revalidate'),
+      { tag: 'carousel' },
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer revalidate-secret' })
+      })
+    )
+
+    delete process.env.FRONTEND_STORE_URL
+    delete process.env.REVALIDATE_TOKEN
   })
 })
