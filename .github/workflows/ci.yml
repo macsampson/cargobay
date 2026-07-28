@@ -55,8 +55,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DIRECT_URL: ${{ secrets.DIRECT_URL }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
     steps:
       - uses: actions/checkout@v7
 
@@ -68,6 +68,20 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
+
+      # Pulls DB/Blob credentials straight from Vercel instead of a duplicated
+      # GitHub secret. VERCEL_ORG_ID/VERCEL_PROJECT_ID above let the CLI treat
+      # the project as linked without an interactive `vercel link`. This way a
+      # Neon credential rotation in Vercel never needs a manual re-sync here.
+      - name: Pull database credentials from Vercel
+        run: |
+          npx vercel env pull .env.ci --environment production --token="${{ secrets.VERCEL_TOKEN }}" --yes
+          {
+            grep '^DATABASE_URL=' .env.ci | sed -E 's/="(.*)"$/=\1/'
+            grep '^DATABASE_URL_UNPOOLED=' .env.ci | sed -E 's/^DATABASE_URL_UNPOOLED="(.*)"$/DIRECT_URL=\1/'
+            grep '^BLOB_READ_WRITE_TOKEN=' .env.ci | sed -E 's/="(.*)"$/=\1/'
+          } >> "$GITHUB_ENV"
+          rm .env.ci
 
       - name: Run database migrations
         run: npm run deploy
@@ -89,8 +103,8 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: ${{ secrets.DEMO_DATABASE_URL }}
-      DIRECT_URL: ${{ secrets.DEMO_DIRECT_URL }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.DEMO_VERCEL_PROJECT_ID }}
     steps:
       - uses: actions/checkout@v7
 
@@ -102,6 +116,18 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --legacy-peer-deps
+
+      # See the note in the `deploy` job above — same reasoning, scoped to the
+      # demo project via VERCEL_PROJECT_ID=DEMO_VERCEL_PROJECT_ID.
+      - name: Pull database credentials from Vercel
+        run: |
+          npx vercel env pull .env.ci --environment production --token="${{ secrets.VERCEL_TOKEN }}" --yes
+          {
+            grep '^DATABASE_URL=' .env.ci | sed -E 's/="(.*)"$/=\1/'
+            grep '^DATABASE_URL_UNPOOLED=' .env.ci | sed -E 's/^DATABASE_URL_UNPOOLED="(.*)"$/DIRECT_URL=\1/'
+            grep '^BLOB_READ_WRITE_TOKEN=' .env.ci | sed -E 's/="(.*)"$/=\1/'
+          } >> "$GITHUB_ENV"
+          rm .env.ci
 
       - name: Run database migrations against the demo database
         run: npm run deploy

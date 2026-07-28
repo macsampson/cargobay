@@ -16,8 +16,8 @@ jobs:
   rollback:
     runs-on: ubuntu-latest
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      DIRECT_URL: ${{ secrets.DIRECT_URL }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
     steps:
       - name: Verify confirmation
         run: |
@@ -36,6 +36,17 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      # See ci.yml's `deploy` job for why this pulls live from Vercel instead
+      # of a duplicated GitHub secret.
+      - name: Pull database credentials from Vercel
+        run: |
+          npx vercel env pull .env.ci --environment production --token="${{ secrets.VERCEL_TOKEN }}" --yes
+          {
+            grep '^DATABASE_URL=' .env.ci | sed -E 's/="(.*)"$/=\1/'
+            grep '^DATABASE_URL_UNPOOLED=' .env.ci | sed -E 's/^DATABASE_URL_UNPOOLED="(.*)"$/DIRECT_URL=\1/'
+          } >> "$GITHUB_ENV"
+          rm .env.ci
 
       - name: Rollback migration
 
