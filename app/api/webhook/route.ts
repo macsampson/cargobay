@@ -61,21 +61,6 @@ export async function POST(req: Request) {
       return new NextResponse('Store ID is required', { status: 400 })
     }
 
-    // Stripe may redeliver the same event (e.g. on a timeout or retry), so
-    // record it before doing any work and bail out if we've already processed it.
-    // Otherwise a redelivered event would create a duplicate order and double-decrement inventory.
-    try {
-      await prismadb.processedWebhookEvent.create({
-        data: { stripeEventId: event.id }
-      })
-    } catch (error: any) {
-      if (error?.code === 'P2002') {
-        logger.info('Ignoring already-processed webhook event', event.id)
-        return new NextResponse(null, { status: 200 })
-      }
-      throw error
-    }
-
     try {
       const storeId = session.metadata.storeId
       const shippingAddress: Address = JSON.parse(
@@ -118,7 +103,35 @@ export async function POST(req: Request) {
         return true
       })
 
+
+      // Stripe redelivers events on timeouts and retries, so the order write
+      // is guarded by an idempotency marker.
+      //
+      // Crucially the marker is inserted INSIDE the same transaction as the
+      // order. It used to be its own statement before the transaction, which
+      // meant a failed order write left the marker behind: every retry then
+      // saw a duplicate key, returned 200, and the paid order was lost for
+      // good. Sharing the transaction makes the marker and the order commit or
+      // roll back together.
+      //
+      // A duplicate marker no longer short-circuits the whole handler either —
+      // it just skips the order write and falls through to settling the hold,
+      // which is idempotent on its own. That way a retry can still finish work
+      // that failed after the order was created.
+      let alreadyRecorded = false
       const order = await prismadb.$transaction(async (tx) => {
+        try {
+          await tx.processedWebhookEvent.create({
+            data: { stripeEventId: event.id }
+          })
+        } catch (error: any) {
+          if (error?.code === 'P2002') {
+            alreadyRecorded = true
+            return null
+          }
+          throw error
+        }
+
         const order = await tx.order.create({
           data: {
             storeId,
@@ -129,11 +142,9 @@ export async function POST(req: Request) {
             billingAddress: session.customer_details?.address ?
               `${session.customer_details.address.line1 || ''} ${session.customer_details.address.line2 || ''}, ${session.customer_details.address.city || ''}, ${session.customer_details.address.state || ''} ${session.customer_details.address.postal_code || ''}, ${session.customer_details.address.country || ''}`.trim()
               : '',
-            shippingAddress: `${shippingAddress.street || ''} ${
-              shippingAddress.apartment || ''
-            }, ${shippingAddress.city || ''}, ${shippingAddress.state || ''} ${
-              shippingAddress.zip || ''
-            }, ${shippingAddress.country || ''}`.trim(),
+            shippingAddress: `${shippingAddress.street || ''} ${shippingAddress.apartment || ''
+              }, ${shippingAddress.city || ''}, ${shippingAddress.state || ''} ${shippingAddress.zip || ''
+              }, ${shippingAddress.country || ''}`.trim(),
             totalPriceInCents
           }
         })
@@ -152,12 +163,8 @@ export async function POST(req: Request) {
           })
         }
 
-        // Reduce inventory as a single atomic, clamped UPDATE per row (rather
-        // than reading quantity and writing Math.max(0, ...) back) so two
-        // concurrent webhook deliveries for different orders can't both read
-        // the same quantity and both decrement from it, over-selling stock.
-        // Quantities are aggregated per product/variation first in case a cart
-        // ever contains more than one line for the same one.
+        // Reduce inventory. Quantities are aggregated per product/variation
+        // first in case a cart contains more than one line for the same one.
         const productQuantities = new Map<string, number>()
         const variationQuantities = new Map<string, number>()
         for (const item of validItems) {
@@ -168,18 +175,36 @@ export async function POST(req: Request) {
           }
         }
 
+        // The guard is `AND quantity >= $1` rather than the GREATEST(…, 0)
+        // clamp this used to carry. Clamping absorbed oversell silently: every
+        // caller "succeeded", the column floored at zero, and nothing recorded
+        // that more units had been sold than existed. Affecting zero rows now
+        // means the books disagree, and that gets logged rather than hidden.
+        const shortfalls: string[] = []
+
         for (const [productId, quantity] of Array.from(productQuantities)) {
-          await tx.$executeRawUnsafe(
-            'UPDATE product SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+          const affected = await tx.$executeRawUnsafe(
+            'UPDATE product SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
             quantity,
             productId
           )
+          if (affected === 0) shortfalls.push(`product:${productId}`)
         }
         for (const [variationId, quantity] of Array.from(variationQuantities)) {
-          await tx.$executeRawUnsafe(
-            'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+          const affected = await tx.$executeRawUnsafe(
+            'UPDATE product_variation SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
             quantity,
             variationId
+          )
+          if (affected === 0) shortfalls.push(`variation:${variationId}`)
+        }
+
+        if (shortfalls.length > 0) {
+          // Not thrown: the customer has already paid and the order must be
+          // recorded. This is an operator-facing reconciliation alert.
+          logger.error(
+            '[WEBHOOK] inventory decrement affected no rows — stock records are behind what was sold',
+            { orderId: order.id, skus: shortfalls }
           )
         }
 
@@ -188,8 +213,15 @@ export async function POST(req: Request) {
 
       // Customer info is stored in the order itself, no separate customer table
 
-      logger.info('Order created successfully:', order.id)
+      if (alreadyRecorded) {
+        logger.info('Order for this event already processed', event.id)
+      } else {
+        logger.info('Order created successfully:', order!.id)
+      }
     } catch (error) {
+      // Returning 500 asks Stripe to redeliver. That is now safe: the marker
+      // rolled back with the order, so a retry redoes the work rather than
+      // being swallowed as a duplicate.
       logger.error('Error processing webhook:', error)
       return new NextResponse('Error processing order', { status: 500 })
     }

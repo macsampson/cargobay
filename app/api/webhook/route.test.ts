@@ -2,6 +2,7 @@ import { POST } from './route'
 import prismadb from '@/lib/prismadb'
 import { stripe } from '@/lib/stripe'
 import { headers } from 'next/headers'
+import { logger } from '@/lib/logger'
 
 jest.mock('@/lib/stripe', () => ({
   stripe: {
@@ -15,8 +16,13 @@ jest.mock('next/headers', () => ({
   headers: jest.fn()
 }))
 
+jest.mock('@/lib/logger', () => ({
+  logger: { info: jest.fn(), error: jest.fn(), warn: jest.fn(), debug: jest.fn() }
+}))
+
 const constructEventMock = stripe.webhooks.constructEvent as jest.Mock
 const prismaMock = prismadb as any
+const loggerErrorMock = logger.error as jest.Mock
 
 function makeRequest(body: string) {
   return new Request('http://localhost/api/webhook', { method: 'POST', body })
@@ -141,7 +147,7 @@ describe('POST /api/webhook', () => {
       ]
     })
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
-      'UPDATE product SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+      'UPDATE product SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
       2,
       'product-1'
     )
@@ -315,12 +321,12 @@ describe('POST /api/webhook', () => {
       ]
     })
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
-      'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+      'UPDATE product_variation SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
       3,
       'var-1'
     )
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
-      'UPDATE product_variation SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+      'UPDATE product_variation SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
       1,
       'var-2'
     )
@@ -329,7 +335,7 @@ describe('POST /api/webhook', () => {
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledTimes(2)
   })
 
-  it('floors inventory at 0 when cart quantity exceeds stock (clamped in SQL, not app code)', async () => {
+  it('guards the inventory decrement so it cannot drive stock negative, and flags the shortfall instead of clamping', async () => {
     const cartItems = [
       { productId: 'product-1', variationId: null, quantity: 5, name: 'Widget', weight: 1, unitPriceInCents: 1500, discountType: 'none', discountId: null }
     ]
@@ -349,15 +355,24 @@ describe('POST /api/webhook', () => {
     prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
     prismaMock.product.findMany.mockResolvedValue([{ id: 'product-1', quantity: 2 }])
     prismaMock.orderItem.createMany.mockResolvedValue({ count: 1 })
-    prismaMock.$executeRawUnsafe.mockResolvedValue(1)
+    // Zero rows affected: only 2 units on hand but 5 were sold. The old
+    // GREATEST(..., 0) clamp would have silently floored the column at 0 and
+    // reported success; the guarded UPDATE leaves stock untouched instead.
+    prismaMock.$executeRawUnsafe.mockResolvedValue(0)
 
     const response = await POST(makeRequest('{}'))
 
+    // The customer has paid, so the order is still recorded — but the mismatch
+    // is surfaced to the operator rather than absorbed.
     expect(response.status).toBe(200)
     expect(prismaMock.$executeRawUnsafe).toHaveBeenCalledWith(
-      'UPDATE product SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2',
+      'UPDATE product SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
       5,
       'product-1'
+    )
+    expect(loggerErrorMock).toHaveBeenCalledWith(
+      expect.stringContaining('inventory decrement affected no rows'),
+      expect.objectContaining({ skus: ['product:product-1'] })
     )
   })
 
@@ -446,5 +461,47 @@ describe('POST /api/webhook', () => {
 
     expect(response.status).toBe(200)
     expect(prismaMock.order.create).not.toHaveBeenCalled()
+  })
+
+  it('records the idempotency marker inside the order transaction, not before it', async () => {
+    // Regression guard for the bug this integration fixed. The marker used to
+    // be its own statement ahead of the transaction, so a failed order write
+    // left it behind: every Stripe retry then saw a duplicate key, returned
+    // 200, and the paid order was lost permanently. Both writes must now go
+    // through the same transaction callback.
+    constructEventMock.mockReturnValue({
+      id: 'evt_1',
+      type: 'checkout.session.completed',
+      data: {
+        object: {
+          id: 'sess_1',
+          amount_total: 1000,
+          metadata: { storeId: 'store-1', cartItems: JSON.stringify([]) }
+        }
+      }
+    })
+    prismaMock.order.create.mockResolvedValue({ id: 'order-1' })
+    prismaMock.product.findMany.mockResolvedValue([])
+
+    let markerWrittenInsideTransaction = false
+    prismaMock.$transaction.mockImplementation(async (fn: any) => {
+      const tx = {
+        ...prismaMock,
+        processedWebhookEvent: {
+          create: jest.fn(async () => {
+            markerWrittenInsideTransaction = true
+            return {}
+          })
+        }
+      }
+      return fn(tx)
+    })
+
+    const response = await POST(makeRequest('{}'))
+
+    expect(response.status).toBe(200)
+    expect(markerWrittenInsideTransaction).toBe(true)
+    // Nothing may write the marker outside the transaction.
+    expect(prismaMock.processedWebhookEvent.create).not.toHaveBeenCalled()
   })
 })
