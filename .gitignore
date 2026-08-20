@@ -53,10 +53,10 @@ CLAUDE.md
 ARCHITECTURE.md
 INTERVIEW_CHEATSHEET.md
 
-
 .env*
 .claude
 .agents
 skills-lock.json
 
 supabase*.md
+
