@@ -3,9 +3,14 @@ import { NextRequest, NextResponse } from 'next/server'
 import prismadb from '@/lib/prismadb'
 import { logger } from '@/lib/logger'
 
-// This cron job runs globally across all stores (there's no per-store schedule):
-// 1. Checks for unpaid orders made in the last hour and reincrements the product quantities
-// 2. Activates/deactivates sales based on their scheduled start/end dates
+// This cron job runs globally across all stores (there's no per-store schedule).
+//
+// It used to also "release" inventory for unpaid orders older than an hour by
+// re-incrementing product quantities. That code could never run: no path in
+// this app creates an unpaid order, because inventory is only ever decremented
+// after payment. It was the release half of a reservation system that did not
+// exist, compensating for a state that could not occur. What remains is sales
+// scheduling.
 export async function POST(req: NextRequest) {
   return executeCronJob(req)
 }
@@ -16,46 +21,7 @@ export async function GET(req: NextRequest) {
 
 async function executeCronJob(req: NextRequest) {
   try {
-    // 1. Handle abandoned order cleanup
-    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
-    const orders = await prismadb.order.findMany({
-      where: {
-        isPaid: false,
-        isAbandoned: false,
-        createdAt: {
-          lt: oneHourAgo,
-        },
-      },
-      include: {
-        orderItems: {
-          include: {
-            product: true,
-          },
-        },
-      },
-    })
-
-    // Reincrement product quantities and mark orders as abandoned
-    for (const order of orders) {
-      // Mark the order as abandoned
-      await prismadb.order.update({
-        where: { id: order.id },
-        data: { isAbandoned: true },
-      })
-
-      for (const item of order.orderItems) {
-        await prismadb.product.update({
-          where: { id: item.productId },
-          data: {
-            quantity: {
-              increment: item.quantity,
-            },
-          },
-        })
-      }
-    }
-
-    // 2. Handle sales scheduling
+    // Handle sales scheduling
     const now = new Date()
     
     // Activate sales that should be active now but aren't
@@ -98,14 +64,6 @@ async function executeCronJob(req: NextRequest) {
     }
 
     const messages = []
-    if (orders.length === 0) {
-      logger.info('No abandoned orders found')
-      messages.push('No abandoned orders found')
-    } else {
-      logger.info(`Released inventory for ${orders.length} abandoned orders`)
-      messages.push(`Released inventory for ${orders.length} abandoned orders`)
-    }
-
     if (salesToActivate.length > 0) {
       messages.push(`Activated ${salesToActivate.length} sales`)
     }
