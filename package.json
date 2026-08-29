@@ -57,7 +57,7 @@
     "recharts": "^2.15.4",
     "shippo": "^1.7.1",
     "stripe": "^14.1.0",
-    "tailwind-merge": "^1.14.0",
+    "tailwind-merge": "^3.6.0",
     "tailwindcss-animate": "^1.0.7",
     "uuid": "^14.0.1",
     "zod": "^3.25.76",
